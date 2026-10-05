@@ -9,13 +9,13 @@
       </div>
     </div>
 
-    <!-- 主体：左侧状态 + 右侧操作 -->
+    <!-- 主体 -->
     <div class="body">
-      <!-- 左：关键信息 -->
+      <!-- 左：账号与地址 -->
       <div class="card info">
         <div class="row">
           <text class="k">账号</text>
-          <text class="v">{{ status.account || '未登录' }}</text>
+          <text class="v">{{ loginText }}</text>
         </div>
         <div class="row">
           <text class="k">PID</text>
@@ -31,22 +31,22 @@
         </div>
       </div>
 
-      <!-- 中：操作按钮 -->
+      <!-- 中：操作 -->
       <div class="card ops">
-        <div
-          :class="['btn', 'btn-start', busy ? 'btn-disabled' : (status.running ? 'btn-dim' : '')]"
-          @click="onStart"
-        >
+        <div :class="['btn', 'btn-half', busy ? 'btn-disabled' : (status.running ? 'btn-dim' : 'btn-start')]" @click="onStart">
           <text class="btn-t">启动</text>
         </div>
-        <div
-          :class="['btn', 'btn-stop', busy ? 'btn-disabled' : (status.running ? '' : 'btn-dim')]"
-          @click="onStop"
-        >
+        <div :class="['btn', 'btn-half', busy ? 'btn-disabled' : (status.running ? 'btn-stop' : 'btn-dim')]" @click="onStop">
           <text class="btn-t">停止</text>
         </div>
-        <div :class="['btn', 'btn-mini', busy ? 'btn-disabled' : '']" @click="onPing">
+        <div :class="['btn', 'btn-half', 'btn-accent', busy ? 'btn-disabled' : '']" @click="onShowQr">
+          <text class="btn-t">二维码</text>
+        </div>
+        <div :class="['btn', 'btn-half', 'btn-accent', busy ? 'btn-disabled' : '']" @click="onPing">
           <text class="btn-t">测 OneBot</text>
+        </div>
+        <div :class="['btn', 'btn-full', busy ? 'btn-disabled' : (status.onebotEnabled ? 'btn-warn' : 'btn-ok')]" @click="onToggleOnebot">
+          <text class="btn-t">{{ status.onebotEnabled ? '关闭 OneBot' : '开启 OneBot' }}</text>
         </div>
       </div>
 
@@ -71,7 +71,7 @@
       </div>
     </div>
 
-    <!-- 底部：日志 -->
+    <!-- 底部日志 -->
     <div class="logbox">
       <div class="logbar">
         <text class="log-t">日志</text>
@@ -82,12 +82,26 @@
       <scroller class="logscroll" scroll-y="true">
         <text class="logtext">{{ logText }}</text>
       </scroller>
-      <text class="logtext">{{ probeText }}</text>
     </div>
 
     <!-- 提示条 -->
     <div v-if="toast" class="toast">
       <text class="toast-t">{{ toast }}</text>
+    </div>
+
+    <!-- 二维码弹层：扫码登录 -->
+    <div v-if="qrModal" class="modal" @click="closeQr">
+      <div class="qr-body" @click.stop>
+        <text class="modal-title">扫码登录 QQ</text>
+        <div class="qr-wrap">
+          <image v-if="qrSrc" class="qr-img" :src="qrSrc" width="176" height="176" />
+          <text v-else class="qr-empty">{{ qrHint }}</text>
+        </div>
+        <text class="qr-tip">{{ qrSub }}</text>
+        <div class="modal-btn" @click="closeQr">
+          <text class="btn-t">关闭</text>
+        </div>
+      </div>
     </div>
 
     <!-- 日志弹层 -->
@@ -115,12 +129,18 @@ import {
   pingOneBot,
   getLogs,
   clearLogs,
+  getQrcode,
+  setOnebot,
   isNativeAvailable,
   probeSync
 } from '../../services/napcat.js'
 
 // 轮询间隔（毫秒）。NapCat 启停是秒级操作，2.5s 足够且不浪费 CPU。
 const POLL_MS = 2500
+// 二维码刷新间隔（NapCat 的码约 2 分钟过期，这里 10s 拉一次）
+const QR_MS = 10000
+// OneBot 默认端口
+const DEFAULT_ONEBOT_PORT = 3000
 
 export default {
   data() {
@@ -129,18 +149,25 @@ export default {
         running: false,
         pid: -1,
         webuiPort: 6099,
-        onebotPort: 3000,
+        onebotPort: 0,
+        onebotEnabled: false,
         ip: '',
-        account: ''
+        account: '',
+        loggedIn: false,
+        needQrcode: false
       },
       device: {},
       busy: false,
       toast: '',
       logText: '（尚未加载）',
       logModal: false,
+      qrModal: false,
+      qrSrc: '',
+      qrHint: '正在获取二维码…',
+      qrSub: '用手机 QQ 扫码授权登录',
       onebotResult: null,
       nativeAvailable: isNativeAvailable(),
-      probeText: '…'
+      probeText: ''
     }
   },
 
@@ -148,6 +175,11 @@ export default {
     statusText() {
       if (this.busy) return '处理中…'
       return this.status.running ? '运行中' : '已停止'
+    },
+    loginText() {
+      if (!this.status.running) return '未运行'
+      if (this.status.loggedIn) return this.status.account || '已登录'
+      return '未登录'
     },
     webuiUrl() {
       const ip = this.status.ip || '—'
@@ -159,7 +191,7 @@ export default {
       if (!d || !d.memTotalKb) return '—'
       const total = Math.round(d.memTotalKb / 1024)
       const avail = Math.round((d.memAvailableKb || 0) / 1024)
-      return avail + 'M 可用 / ' + total + 'M'
+      return avail + 'M / ' + total + 'M'
     },
     diskText() {
       const d = this.device
@@ -167,9 +199,13 @@ export default {
       return (d.diskFreeKb / 1048576).toFixed(1) + 'G'
     },
     onebotText() {
-      if (!this.onebotResult) return this.status.onebotPort + ' (未测)'
-      if (!this.onebotResult.ok) return this.status.onebotPort + ' 不可达'
-      return this.status.onebotPort + ' 通 (' + this.onebotResult.latencyMs + 'ms)'
+      const p = this.status.onebotPort
+      if (!p) return '未启用'
+      if (this.onebotResult) {
+        if (this.onebotResult.ok) return p + ' 通 (' + this.onebotResult.latencyMs + 'ms)'
+        return p + ' 不可达'
+      }
+      return p + (this.status.onebotEnabled ? '' : ' (已关闭)')
     },
     nativeText() {
       return this.nativeAvailable ? 'ok' : '缺失'
@@ -178,61 +214,29 @@ export default {
 
   methods: {
     // ================================================================
-    // 生命周期钩子必须放在 methods 里！
-    // BasePage 通过 this.$root.onShow() / onHide() / onUnload() 调用，
-    // 它们被视为 Vue 组件方法，放在顶层（Vue options）不会被触发。
+    // 生命周期钩子必须放在 methods 里 —— BasePage 通过 $root.onXxx() 调用
     // ================================================================
     onLoad() {
       this.options = {}
-      if (!this.nativeAvailable) {
-        this.showToast('native 模块缺失，功能受限')
-      }
-      // 诊断：把 native 模块的实际形态显示到界面，便于真机排查
-      this.probe()
+      if (!this.nativeAvailable) this.showToast('native 模块缺失，功能受限')
     },
 
-    // 一次性自检：先测同步方法（区分模块不可用 vs 异步挂起），再测异步
-    async probe() {
-      const lines = []
-      lines.push('native=' + (this.nativeAvailable ? 'ok' : 'missing'))
-      // 同步自检：若这行能出结果，说明模块可用，问题在异步
-      try {
-        lines.push(probeSync())
-      } catch (e) {
-        lines.push('probeSync throw: ' + (e && e.message ? e.message : e))
-      }
-      this.probeText = lines.join(' | ')
-
-      // 异步自检单独一步，避免卡住时看不到上面的结果
-      try {
-        const r = await getStatus()
-        lines.push('getStatus=' + (r && !r.error ? 'ok' : 'ERR:' + ((r && r.error) || 'empty')))
-        if (r && !r.error) lines.push('running=' + r.running)
-        this.probeText = lines.join(' | ')
-      } catch (e) {
-        lines.push('getStatus throw: ' + (e && e.message ? e.message : e))
-        this.probeText = lines.join(' | ')
-      }
+    onShow() {
+      this.startPoll()
     },
 
     onHide() {
       this.stopPoll()
-    },
-
-    onShow() {
-      // 进入页面即开始轮询；每次 onShow 都重置，避免重复定时器
-      this.startPoll()
+      this.stopQrPoll()
     },
 
     onUnload() {
-      // 先停轮询，再清理所有登记过的 timer，避免页面销毁后回调仍触发
       this.stopPoll()
+      this.stopQrPoll()
       this._clearAllTimers()
     },
 
-    // ---------- 定时器管理 ----------
-    // 说明：Vue 组件实例拿不到 BasePage 的 timer 方法，
-    // 这里用全局 timer 并自行登记，onUnload 统一清理，避免泄漏。
+    // ---------- 定时器 ----------
     _addTimer(token) {
       if (!this._timers) this._timers = []
       this._timers.push(token)
@@ -247,19 +251,17 @@ export default {
       this._timers = []
     },
 
-    // ---------- 轮询 ----------
+    // ---------- 状态轮询 ----------
     startPoll() {
       this.stopPoll()
       this.refresh()
       this.pollToken = this._addTimer(
         setInterval(() => {
-          // 弹层打开或忙碌时不打扰
           if (this.busy || this.logModal) return
           this.refresh()
         }, POLL_MS)
       )
     },
-
     stopPoll() {
       if (this.pollToken != null) {
         clearInterval(this.pollToken)
@@ -274,44 +276,32 @@ export default {
       if (dev && !dev.error) this.device = dev
     },
 
-    // ---------- 操作 ----------
+    // ---------- 启停 ----------
     async onStart() {
       if (this.busy) return
-      if (this.status.running) {
-        this.showToast('已经在运行')
-        return
-      }
+      if (this.status.running) return this.showToast('已经在运行')
       this.busy = true
       this.showToast('正在启动…')
       const r = await napcatStart()
       this.busy = false
-      if (!r.ok) {
-        this.showToast('启动失败：' + r.error)
-        return
-      }
-      this.showToast('启动命令已下发')
-      // 启动需要时间，稍后复查
+      if (!r.ok) return this.showToast('启动失败：' + r.error)
+      this.showToast('已下发启动命令')
       this._addTimer(setTimeout(() => this.refresh(), 3000))
     },
 
     async onStop() {
       if (this.busy) return
-      if (!this.status.running) {
-        this.showToast('已经停止')
-        return
-      }
+      if (!this.status.running) return this.showToast('已经停止')
       this.busy = true
       this.showToast('正在停止…')
       const r = await napcatStop()
       this.busy = false
-      if (!r.ok) {
-        this.showToast('停止失败：' + r.error)
-        return
-      }
+      if (!r.ok) return this.showToast('停止失败：' + r.error)
       this.showToast('已停止')
       this.refresh()
     },
 
+    // ---------- OneBot ----------
     async onPing() {
       if (this.busy) return
       this.busy = true
@@ -319,22 +309,79 @@ export default {
       this.busy = false
       this.onebotResult = r
       if (!r.ok) {
-        this.showToast('OneBot 不可达（' + (r.message || r.error || '') + '）')
+        const why = this.status.onebotEnabled ? (r.message || r.error || '') : '尚未开启 OneBot'
+        this.showToast('不可达：' + why)
       } else {
         this.showToast('OneBot 正常，' + r.latencyMs + 'ms')
       }
     },
 
+    async onToggleOnebot() {
+      if (this.busy) return
+      const enable = !this.status.onebotEnabled
+      const port = this.status.onebotPort || DEFAULT_ONEBOT_PORT
+      this.busy = true
+      this.showToast(enable ? '正在开启 OneBot…' : '正在关闭 OneBot…')
+      const r = await setOnebot(enable, port)
+      this.busy = false
+      if (!r.ok) return this.showToast('操作失败：' + r.error)
+      this.showToast(enable ? '已开启，重启后生效' : '已关闭，重启后生效')
+      this._addTimer(setTimeout(() => this.refresh(), 1500))
+    },
+
+    // ---------- 二维码 ----------
+    async onShowQr() {
+      if (this.busy) return
+      this.qrModal = true
+      await this.loadQr()
+      this.startQrPoll()
+    },
+    closeQr() {
+      this.qrModal = false
+      this.stopQrPoll()
+    },
+    startQrPoll() {
+      this.stopQrPoll()
+      this.qrToken = this._addTimer(setInterval(() => this.loadQr(), QR_MS))
+    },
+    stopQrPoll() {
+      if (this.qrToken != null) {
+        clearInterval(this.qrToken)
+        this.qrToken = null
+      }
+    },
+    async loadQr() {
+      const r = await getQrcode()
+      if (!r.ok) {
+        this.qrSrc = ''
+        this.qrHint = '读取失败：' + r.error
+        return
+      }
+      if (!r.base64) {
+        this.qrSrc = ''
+        if (!this.status.running) {
+          this.qrHint = 'NapCat 未运行，请先启动'
+        } else if (this.status.loggedIn) {
+          this.qrHint = '已登录，无需扫码'
+        } else {
+          this.qrHint = '暂无二维码，请稍候…'
+        }
+        this.qrSub = this.status.loggedIn ? '' : '二维码约每 2 分钟刷新一次'
+        return
+      }
+      this.qrSrc = 'data:image/png;base64,' + r.base64
+      this.qrSub = '用手机 QQ 扫码授权（约 2 分钟刷新）'
+    },
+
+    // ---------- 日志 ----------
     async showLogs() {
       await this.loadLogs(300)
       this.logModal = true
     },
-
     async loadLogs(tail) {
       const r = await getLogs(tail)
       this.logText = r.ok ? (r.text || '（空）') : ('读取失败：' + r.error)
     },
-
     async onClearLogs() {
       const r = await clearLogs()
       if (r.ok) {
@@ -344,7 +391,6 @@ export default {
         this.showToast('清空失败：' + r.error)
       }
     },
-
     async onRefresh() {
       await this.loadLogs(120)
       this.showToast('已刷新')
@@ -379,7 +425,7 @@ export default {
 }
 
 .hdr {
-  height: 30px;
+  height: 28px;
   display: flex;
   flex-direction: row;
   align-items: center;
@@ -402,12 +448,8 @@ export default {
   border-radius: 5px;
   margin-right: 6px;
 }
-.dot-on {
-  background-color: @ok;
-}
-.dot-off {
-  background-color: @off;
-}
+.dot-on { background-color: @ok; }
+.dot-off { background-color: @off; }
 .hdr-state {
   font-size: 13px;
   color: @fg-dim;
@@ -433,13 +475,13 @@ export default {
   justify-content: center;
 }
 .ops {
-  width: 210px;
+  width: 216px;
   margin: 0 8px;
   display: flex;
   flex-direction: row;
   flex-wrap: wrap;
-  align-items: center;
-  justify-content: center;
+  align-content: center;
+  justify-content: space-between;
 }
 
 .row {
@@ -460,40 +502,35 @@ export default {
 }
 
 .btn {
-  height: 40px;
+  height: 36px;
   border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 .btn-t {
-  font-size: 14px;
+  font-size: 13px;
   color: #ffffff;
 }
-.btn-start {
-  width: 95px;
-  background-color: @ok;
-  margin-right: 8px;
+// 卡片内容宽 = 216 - 2*10(padding) = 196px，两列各 92px 才能放下
+.btn-half {
+  width: 92px;
+  margin-bottom: 6px;
 }
-.btn-stop {
-  width: 95px;
-  background-color: @danger;
-}
-.btn-mini {
-  width: 198px;
+.btn-full {
+  width: 196px;
   height: 30px;
-  margin-top: 8px;
-  background-color: @accent;
 }
-.btn-dim {
-  opacity: 0.4;
-}
-.btn-disabled {
-  opacity: 0.5;
-}
+.btn-start { background-color: @ok; }
+.btn-stop { background-color: @danger; }
+.btn-accent { background-color: @accent; }
+.btn-ok { background-color: @ok; }
+.btn-warn { background-color: @warn; }
+.btn-dim { opacity: 0.4; }
+.btn-disabled { opacity: 0.5; }
 
 .logbox {
-  height: 96px;
+  height: 92px;
   margin-top: 6px;
   background-color: @card;
   border-radius: 8px;
@@ -532,9 +569,9 @@ export default {
   position: absolute;
   left: 50%;
   bottom: 14px;
-  margin-left: -140px;
-  width: 280px;
-  background-color: rgba(0, 0, 0, 0.82);
+  margin-left: -150px;
+  width: 300px;
+  background-color: rgba(0, 0, 0, 0.85);
   border-radius: 6px;
   padding: 6px 10px;
   display: flex;
@@ -552,7 +589,7 @@ export default {
   top: 0;
   width: 100%;
   height: 100%;
-  background-color: rgba(0, 0, 0, 0.72);
+  background-color: rgba(0, 0, 0, 0.78);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -577,12 +614,45 @@ export default {
   width: 100%;
 }
 .modal-btn {
-  height: 34px;
+  height: 32px;
   margin-top: 8px;
   border-radius: 8px;
   background-color: @accent;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+// 二维码弹层：横向布局，适配 936x280 的矮屏
+.qr-body {
+  width: 62%;
+  height: 92%;
+  background-color: @card;
+  border-radius: 10px;
+  padding: 8px 12px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.qr-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.qr-img {
+  width: 176px;
+  height: 176px;
+}
+.qr-empty {
+  font-size: 12px;
+  color: @fg-dim;
+}
+.qr-tip {
+  font-size: 11px;
+  color: @fg-dim;
+  margin-top: 2px;
 }
 </style>

@@ -50,9 +50,12 @@ export async function getStatus() {
       running: false,
       pid: -1,
       webuiPort: 6099,
-      onebotPort: 3000,
+      onebotPort: 0,
+      onebotEnabled: false,
       ip: '',
       account: '',
+      loggedIn: false,
+      needQrcode: false,
       error: r.error,
       nativeMissing: !!r.nativeMissing
     }
@@ -62,10 +65,20 @@ export async function getStatus() {
     running: !!d.running,
     pid: typeof d.pid === 'number' ? d.pid : -1,
     webuiPort: typeof d.webuiPort === 'number' ? d.webuiPort : 6099,
-    onebotPort: typeof d.onebotPort === 'number' ? d.onebotPort : 3000,
+    onebotPort: typeof d.onebotPort === 'number' ? d.onebotPort : 0,
+    onebotEnabled: !!d.onebotEnabled,
     ip: d.ip || '',
-    account: d.account || ''
+    account: d.account || '',
+    loggedIn: !!d.loggedIn,
+    needQrcode: !!d.needQrcode
   }
+}
+
+// 配置 OneBot 网络服务（写入 NapCat 配置，需重启生效）
+export async function setOnebot(enable, port) {
+  const r = await call('setOnebot', !!enable, port || 3000)
+  if (!r.ok) return { ok: false, error: r.error }
+  return { ok: true, result: r.data }
 }
 
 // 同步方法自检：不涉及 Promise，用于区分「模块不可用」与「异步挂起」

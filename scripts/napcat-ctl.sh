@@ -59,6 +59,7 @@ start_xvfb() {
 # ---------- 命令 ----------
 
 do_start() {
+    local qq="${1:-}"
     local pid
     pid=$(napcat_pid)
     if [ -n "$pid" ]; then
@@ -66,13 +67,21 @@ do_start() {
         return 0
     fi
 
+    # 记住账号：下次启动/重启免扫码（凭据失效时 NapCat 自动回落二维码）
+    if [ -n "$qq" ]; then
+        echo "$qq" > "$BASE/state/account"
+    fi
+
     ensure_mounts
     start_xvfb || return 1
 
-    echo "启动 NapCat ..."
+    # 优先用保存的账号快速登录
+    local acct="$qq"
+    [ -z "$acct" ] && [ -f "$BASE/state/account" ] && acct=$(cat "$BASE/state/account" 2>/dev/null)
+
+    echo "启动 NapCat ${acct:+(快速登录 $acct)} ..."
     setsid env -u LD_LIBRARY_PATH DISPLAY=$XVFB_DISPLAY \
-        chroot "$R" /bin/sh -c \
-        'cd /opt/QQ && exec ./qq --no-sandbox' \
+        chroot "$R" /bin/sh /root/bin/run-napcat.sh ${acct:+"$acct"} \
         > "$LOG" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
     sleep 4
@@ -118,15 +127,30 @@ do_status() {
     echo "=== NapCat 状态 ==="
     if [ -n "$pid" ]; then
         echo "进程      : 运行中 (PID $pid)"
+        # cmdline 以 \0 分隔，-q 与号码是相邻两个参数
+        echo "账号      : $(tr '\0' '\n' < /proc/$pid/cmdline 2>/dev/null | grep -A1 '^-q$' | tail -1)"
         echo "内存      : $(grep VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2/1024 " MB"}')"
     else
         echo "进程      : 已停止"
+        [ -f "$BASE/state/account" ] && echo "记住账号  : $(cat $BASE/state/account)"
     fi
     xvfb_running && echo "Xvfb      : 运行中" || echo "Xvfb      : 未运行"
     echo "WebUI     : http://$ip:6099/webui"
-    echo "OneBot    : 3000 (在 WebUI 中配置)"
+
+    # OneBot 状态：从当前账号配置读取
+    local cfg
+    cfg=$(ls -1t "$R/opt/QQ/resources/app/napcat/config"/onebot11_*.json 2>/dev/null | head -1)
+    if [ -n "$cfg" ]; then
+        local port en
+        port=$(sed -n 's/.*"port": \([0-9]*\).*/\1/p' "$cfg" | head -1)
+        en=$(grep -c '"enable": true' "$cfg" 2>/dev/null)
+        if [ -n "$port" ] && [ "$en" -gt 0 ] 2>/dev/null; then
+            echo "OneBot    : $port (已启用)"
+        else
+            echo "OneBot    : 未启用"
+        fi
+    fi
     echo "日志      : $LOG"
-    echo "账号      : $(grep -o '登录成功.*' "$LOG" 2>/dev/null | tail -1)"
 }
 
 do_restart() {
@@ -148,9 +172,9 @@ do_install() {
 # ---------- 入口 ----------
 
 case "${1:-status}" in
-    start)   do_start ;;
+    start)   shift; do_start "${1:-}" ;;
     stop)    do_stop ;;
-    restart) do_restart ;;
+    restart) do_stop; sleep 1; do_start ;;
     status)  do_status ;;
     install) shift; do_install "${1:-}" ;;
     *)

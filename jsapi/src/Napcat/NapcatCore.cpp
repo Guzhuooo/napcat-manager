@@ -164,9 +164,80 @@ std::string bsonStr(const Bson &b, const char *k, const std::string &def)
     return def;
 }
 
-std::string localIp()
+bool isQqNumber(const std::string &s)
 {
+    if (s.size() < 5 || s.size() > 12) return false;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
+std::string quickAccountFromProcess(int pid)
+{
+    if (pid <= 0) return std::string();
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    const std::string raw = readFileAll(path);
+    if (raw.empty()) return std::string();
+
+    std::vector<std::string> args;
+    size_t start = 0;
+    for (size_t i = 0; i <= raw.size(); ++i) {
+        if (i == raw.size() || raw[i] == '\0') {
+            args.push_back(raw.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        if (args[i] == "-q" && isQqNumber(args[i + 1])) return args[i + 1];
+    }
     return std::string();
+}
+
+std::string accountStatePath()
+{
+    return std::string(NapcatCore::stateDir()) + "/account";
+}
+
+std::string persistedAccount()
+{
+    const std::string qq = trimTrailing(readFileAll(accountStatePath()));
+    return isQqNumber(qq) ? qq : std::string();
+}
+
+void persistAccount(const std::string &qq)
+{
+    if (!isQqNumber(qq)) return;
+    ::mkdir(NapcatCore::stateDir(), 0755);
+    writeFileAll(accountStatePath(), qq + "\n");
+}
+
+std::string configForAccount(const std::string &qq)
+{
+    if (!isQqNumber(qq)) return std::string();
+    const std::string path = std::string(NapcatCore::rootfsDir()) +
+        "/opt/QQ/resources/app/napcat/config/onebot11_" + qq + ".json";
+    return fileExists(path) ? path : std::string();
+}
+
+// 定位当前活跃账号的 onebot11_<qq>.json。
+// 选择顺序：进程 -q 参数 → 最近修改的账号配置 → 持久账号。
+std::string findOnebotConfig(int runningPid)
+{
+    const std::string cfgDir = std::string(NapcatCore::rootfsDir()) +
+        "/opt/QQ/resources/app/napcat/config";
+
+    const std::string processQq = quickAccountFromProcess(runningPid);
+    const std::string processCfg = configForAccount(processQq);
+    if (!processCfg.empty()) return processCfg;
+
+    // 扫码登录新账号时，NapCat 会刚创建对应配置；最新文件最可靠。
+    const std::string latest = trimTrailing(NapcatCore::exec(
+        "ls -1t " + cfgDir + "/onebot11_*.json 2>/dev/null | head -1"));
+    if (!latest.empty()) return latest;
+
+    return configForAccount(persistedAccount());
 }
 
 }  // namespace
@@ -226,30 +297,21 @@ Bson NapcatCore::queryStatus()
     const std::string webuiCfg = readFileAll(kWebuiCfg);
     if (!webuiCfg.empty()) extractInt(webuiCfg, "port", webuiPort);
 
-    // OneBot 端口：从 napcat 的 onebot11_*.json 里读实际配置
+    // OneBot 状态：始终读「当前活跃账号」的配置。
+    // 多账号时各 QQ 有独立配置，取错会导致显示已开启但端口未监听。
     int onebotPort = 0;          // 0 表示未启用
     bool onebotEnabled = false;
     {
-        const std::string cfgDir =
-            std::string(rootfsDir()) + "/opt/QQ/resources/app/napcat/config";
-        // 配置文件名带账号后缀，这里扫描目录找出 onebot11_*.json
-        const std::string ls = exec(("ls " + cfgDir + "/onebot11_*.json 2>/dev/null").c_str());
-        std::istringstream lss(ls);
-        std::string f;
-        while (std::getline(lss, f)) {
-            f = trimTrailing(f);
-            if (f.empty()) continue;
-            const std::string body = readFileAll(f);
-            if (body.find("\"httpServers\"") == std::string::npos) continue;
-            // 取第一个 httpServers 里的 port
+        const std::string cfgPath = findOnebotConfig(pid);
+        const std::string body = readFileAll(cfgPath);
+        const size_t hp = body.find("\"httpServers\"");
+        if (hp != std::string::npos) {
+            // 只看 httpServers 之后的第一段（数组首项）
+            const std::string seg = body.substr(hp, 800);
             int p = 0;
-            const size_t hp = body.find("\"httpServers\"");
-            if (hp != std::string::npos && extractInt(body.substr(hp), "port", p) && p > 0) {
+            if (extractInt(seg, "port", p) && p > 0) {
                 onebotPort = p;
-                // enable 为 true 才算启用
-                const std::string seg = body.substr(hp, 600);
-                if (seg.find("\"enable\": true") != std::string::npos) onebotEnabled = true;
-                break;
+                onebotEnabled = seg.find("\"enable\": true") != std::string::npos;
             }
         }
     }
@@ -260,31 +322,54 @@ Bson NapcatCore::queryStatus()
     if (ip.empty()) ip = "127.0.0.1";
 
     // ---- 登录状态判定 ----
-    // 依据：NapCat 日志中的明确标记
-    //   已登录：出现 "接收 <-" / "发送 ->" 这类消息收发记录
-    //   待扫码：最近 3 分钟内生成了 qrcode.png
+    // 首选 OneBot API（get_login_info）：在线时返回准确的 QQ 号与昵称；
+    // 接口不通再退回日志特征判定。
     std::string account;
+    std::string qqOfAccount;
     bool loggedIn = false;
     bool needQrcode = false;
 
+    if (pid > 0 && onebotEnabled && onebotPort > 0) {
+        char api[128];
+        std::snprintf(api, sizeof(api),
+                      "curl -s -m 3 -X POST -H 'Content-Type: application/json' "
+                      "-d '{}' http://127.0.0.1:%d/get_login_info 2>/dev/null",
+                      onebotPort);
+        const std::string resp = trimTrailing(exec(api));
+        if (resp.find("\"retcode\":0") != std::string::npos ||
+            resp.find("\"status\":\"ok\"") != std::string::npos) {
+            loggedIn = true;
+            // 提取 nickname（日志里显示昵称）
+            const std::string nickKey = "\"nickname\":\"";
+            const size_t np = resp.find(nickKey);
+            if (np != std::string::npos) {
+                const size_t ns = np + nickKey.size();
+                const size_t ne = resp.find('"', ns);
+                if (ne != std::string::npos && ne > ns) {
+                    account = resp.substr(ns, ne - ns);
+                }
+            }
+            // 提取 user_id
+            const std::string uidKey = "\"user_id\":";
+            const size_t up = resp.find(uidKey);
+            if (up != std::string::npos) {
+                char *end = nullptr;
+                const long v = std::strtol(resp.c_str() + up + uidKey.size(), &end, 10);
+                if (end != resp.c_str() + up + uidKey.size() && v > 0) {
+                    qqOfAccount = std::to_string(v);
+                }
+            }
+        }
+    }
+
     const std::string log = readFileAll(logFile());
-    if (!log.empty()) {
-        // 从后往前找最近一次成功登录
-        const size_t posOk = log.rfind("登录成功");
-        const size_t posErr = log.rfind("Login Error");
+    if (!loggedIn && !log.empty()) {
+        // 日志兜底：有收发记录说明在线
         const size_t posRecv = log.rfind("接收 <-");
         const size_t posSend = log.rfind("发送 ->");
+        loggedIn = (posRecv != std::string::npos) || (posSend != std::string::npos);
 
-        // 有收发记录，说明确实在线
-        const bool hasTraffic =
-            (posRecv != std::string::npos) || (posSend != std::string::npos);
-        // 成功标记晚于最近一次错误，才算当前有效
-        const bool okAfterErr = (posOk != std::string::npos) &&
-                                (posErr == std::string::npos || posOk > posErr);
-        loggedIn = hasTraffic || okAfterErr;
-
-        // 账号名：形如 "小雫 | 接收 <- ..." 或 "登录成功 xxx"
-        if (hasTraffic) {
+        if (loggedIn) {
             const size_t anchor = (posRecv != std::string::npos) ? posRecv : posSend;
             size_t start = log.rfind('\n', anchor);
             start = (start == std::string::npos) ? 0 : start + 1;
@@ -293,16 +378,14 @@ Bson NapcatCore::queryStatus()
                 account = trimTrailing(log.substr(start, bar - start));
             }
         }
-        if (account.empty() && okAfterErr) {
-            // 退而求其次：从 "可用于快速登录" 之后的账号行里取
-            const size_t p = log.rfind("可用于快速登录");
-            if (p != std::string::npos) {
-                const size_t nl = log.find('\n', p);
-                if (nl != std::string::npos) {
-                    account = trimTrailing(log.substr(nl + 1, 60));
-                }
-            }
-        }
+    }
+
+    // 记住当前账号，供下次启动时自动快速登录
+    const std::string procQq = quickAccountFromProcess(pid);
+    if (!procQq.empty()) {
+        persistAccount(procQq);
+    } else if (!qqOfAccount.empty()) {
+        persistAccount(qqOfAccount);
     }
 
     // 二维码新鲜度：3 分钟内的才算"待扫码"
@@ -360,7 +443,11 @@ Bson NapcatCore::start()
     if (!fileExists(kStartScript)) {
         throw std::runtime_error("缺少启动脚本: " + std::string(kStartScript));
     }
-    exec(std::string("sh ") + kStartScript);
+
+    // 带上已记住的账号做快速登录，避免每次重启都要扫码。
+    // 凭据失效时 NapCat 会自行回落到二维码，用户再扫一次即可。
+    const std::string qq = persistedAccount();
+    exec(std::string("sh ") + kStartScript + (qq.empty() ? "" : " " + qq));
     ::usleep(1500 * 1000);
     return queryStatus();
 }
@@ -384,15 +471,18 @@ Bson NapcatCore::quickLogin(const std::string &qq)
     std::string mode = "qrcode";
     std::string safeQq;
 
-    if (!qq.empty()) {
-        // 二次兜底：只保留数字
-        for (char c : qq) {
+    // 无参调用时用已记住的账号
+    std::string target = qq;
+    if (target.empty()) target = persistedAccount();
+
+    if (!target.empty()) {
+        for (char c : target) {
             if (c >= '0' && c <= '9') safeQq.push_back(c);
         }
-        if (safeQq.empty()) throw std::runtime_error("QQ 号不合法");
-        if (safeQq.size() < 5 || safeQq.size() > 12) {
-            throw std::runtime_error("QQ 号长度不合法");
+        if (safeQq.empty() || safeQq.size() < 5 || safeQq.size() > 12) {
+            throw std::runtime_error("QQ 号不合法");
         }
+        persistAccount(safeQq);
         exec(std::string("sh ") + kStartScript + " " + safeQq);
         mode = "quick";
     } else {
@@ -527,28 +617,13 @@ void NapcatCore::writeConfig(const Bson &patch)
 
 // ---------------------------------------------------------------- OneBot 配置
 
-// 定位 napcat 配置目录下的 onebot11_*.json（文件名带账号后缀）
-static std::string findOnebotConfig()
-{
-    const std::string cfgDir =
-        std::string(NapcatCore::rootfsDir()) + "/opt/QQ/resources/app/napcat/config";
-    const std::string ls = NapcatCore::exec("ls " + cfgDir + "/onebot11_*.json 2>/dev/null");
-    std::istringstream lss(ls);
-    std::string f;
-    while (std::getline(lss, f)) {
-        f = trimTrailing(f);
-        if (!f.empty()) return f;
-    }
-    return std::string();
-}
-
 Bson NapcatCore::setOnebot(bool enable, int port)
 {
     if (port < 1 || port > 65535) {
         throw std::runtime_error("端口超出范围 (1-65535)");
     }
 
-    const std::string path = findOnebotConfig();
+    const std::string path = findOnebotConfig(findMainPid());
     if (path.empty()) {
         throw std::runtime_error("未找到 NapCat 的 onebot11 配置文件（请先启动过一次 NapCat）");
     }
