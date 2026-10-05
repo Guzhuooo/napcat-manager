@@ -1,0 +1,35 @@
+{
+    "name": "napcat-manager",
+    "appid": "8001799000000051",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "NapCat 管理器：在词典笔上启停/监控 NapCat，管理 OneBot 与登录",
+    "icon": "app_icon.png",
+    "quickjs": {
+        "version": "20200705",
+        "bigNum": false
+    },
+    "single-js-bundle": false,
+    "scripts": {
+        "build": "aiot-cli -p",
+        "build:dev": "aiot-cli",
+        "package": "aiot-cli -c -q -p",
+        "check": "aiot-cli check"
+    },
+    "keywords": [
+        "napcat",
+        "onebot",
+        "manager",
+        "falcon"
+    ],
+    "dependencies": {
+        "falcon-ui": "^2.0.2"
+    },
+    "devDependencies": {
+        "@vue/compiler-sfc": "^3.5.17",
+        "aiot-vue-cli": "link:../../aiot-vue-cli",
+        "vue": "^3.5.17"
+    },
+    "packageManager": "pnpm@10.12.4",
+    "appName": "NapCat管理器"
+}

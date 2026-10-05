@@ -1,0 +1,138 @@
+name: Build native JSAPI (aarch64)
+
+# ============================================================================
+#  在 GitHub Actions 上交叉编译 libjsapi_napcat.so
+#
+#  目标：有道词典笔 Rockchip RK3562 / aarch64 / glibc 2.36
+#  工具链：Ubuntu 自带的 gcc-aarch64-linux-gnu（glibc 交叉工具链）
+#
+#  本地坚决不编译 C/C++；所有产物由 CI 构建并作为 artifact 上传。
+# ============================================================================
+
+on:
+  push:
+    paths:
+      - 'jsapi/**'
+      - '.github/workflows/build-jsapi.yml'
+  pull_request:
+    paths:
+      - 'jsapi/**'
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: '是否把 .so 上传为 release 资产'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Cross-compile for aarch64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            cmake \
+            ninja-build \
+            file \
+            binutils-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc --version
+
+      - name: Verify device profile matches toolchain
+        run: |
+          echo "=== 目标设备关键事实（来自真机探测）==="
+          echo "SoC      : Rockchip RK3562 (aarch64)"
+          echo "libc     : glibc 2.36"
+          echo "libstdc++: 6.0.29 (GLIBCXX_3.4.29)"
+          echo
+          echo "=== 工具链 glibc 版本（必须 <= 设备）==="
+          aarch64-linux-gnu-gcc -print-file-name=libc.so.6
+          strings "$(aarch64-linux-gnu-gcc -print-file-name=libc.so.6)" \
+            | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -3
+
+      - name: Show SDK presence
+        run: |
+          test -d jsapi/iot-miniapp-sdk/include || { echo "缺少 SDK include"; exit 1; }
+          test -d jsapi/iot-miniapp-sdk/src    || { echo "缺少 SDK src"; exit 1; }
+          echo "SDK 头文件:"; ls jsapi/iot-miniapp-sdk/include
+          echo "源文件:"; find jsapi/src -name '*.cpp' | sort
+
+      - name: Configure (CMake)
+        working-directory: jsapi
+        env:
+          CROSS_TOOLCHAIN_PREFIX: aarch64-linux-gnu-
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_C_FLAGS="-O2" \
+            -DCMAKE_CXX_FLAGS="-O2"
+
+      - name: Build
+        working-directory: jsapi
+        run: cmake --build build -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: Verify produced ELF
+        working-directory: jsapi
+        run: |
+          SO=$(find build -name 'libjsapi_napcat.so' | head -1)
+          if [ -z "$SO" ]; then echo "构建未产出 .so"; exit 1; fi
+          echo "产物: $SO"
+          echo
+          echo "--- file ---"
+          file "$SO"
+          echo
+          echo "--- readelf -h (架构与解释器) ---"
+          readelf -h "$SO" | grep -E 'Class|Machine|Type|Entry'
+          echo
+          echo "--- readelf -d (依赖) ---"
+          readelf -d "$SO" | grep -E 'NEEDED|SONAME' || true
+          echo
+          echo "--- 导出的入口符号 ---"
+          nm -D --defined-only "$SO" | grep -E 'custom_init_jsapis' \
+            || { echo "缺少 custom_init_jsapis 导出"; exit 1; }
+          echo
+          echo "--- GLIBC 符号需求（必须 <= 2.36）---"
+          nm -D --undefined-only "$SO" | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -5 || true
+
+          # 硬性校验：必须是 aarch64
+          if ! file "$SO" | grep -q 'ARM aarch64'; then
+            echo "错误：产物不是 aarch64"; exit 1
+          fi
+
+      - name: Package artifact
+        run: |
+          SO=$(find jsapi/build -name 'libjsapi_napcat.so' | head -1)
+          mkdir -p dist/libs
+          cp "$SO" dist/libs/libjsapi_napcat.so
+          # 同时归档调试信息，便于事后排查
+          aarch64-linux-gnu-objcopy --only-keep-debug "$SO" dist/libjsapi_napcat.so.debug || true
+          sha256sum dist/libs/libjsapi_napcat.so | tee dist/SHA256SUMS
+          ls -la dist/libs/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libjsapi_napcat-aarch64
+          path: |
+            dist/libs/libjsapi_napcat.so
+            dist/libjsapi_napcat.so.debug
+            dist/SHA256SUMS
+            jsapi/build.log
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-failed
+          path: jsapi/build.log
+          if-no-files-found: ignore

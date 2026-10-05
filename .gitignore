@@ -1,0 +1,8 @@
+node_modules/
+ui/.falcon_/
+ui/.falcon_tmp/
+dist/
+build/
+*.amr
+*.log
+.DS_Store
