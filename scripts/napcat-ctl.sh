@@ -159,6 +159,10 @@ do_restart() {
     do_start
 }
 
+do_ip() {
+    ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1
+}
+
 do_install() {
     local amr=$1
     if [ -z "$amr" ] || [ ! -f "$amr" ]; then
@@ -176,9 +180,10 @@ case "${1:-status}" in
     stop)    do_stop ;;
     restart) do_stop; sleep 1; do_start ;;
     status)  do_status ;;
+    ip)      do_ip ;;
     install) shift; do_install "${1:-}" ;;
     *)
-        echo "用法: $0 {start|stop|restart|status|install <amr>}"
+        echo "用法: $0 {start|stop|restart|status|ip|install <amr>}"
         exit 1
         ;;
 esac
