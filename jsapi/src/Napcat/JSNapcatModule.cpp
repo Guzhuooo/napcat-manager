@@ -1,6 +1,5 @@
 #include "Napcat/JSNapcatModule.hpp"
 #include "Napcat/NapcatCore.hpp"
-#include <Exceptions/AssertFailed.hpp>
 #include <jqutil_v2/jqbson.h>
 
 using namespace napcat;
@@ -48,23 +47,18 @@ void JSNapcatModule::getVersion(JQFunctionInfo &info)
 
 void JSNapcatModule::getStatus(JQAsyncInfo &info)
 {
-    // 先取参数（Promise handler 里参数已序列化为 Bson）
-    try {
-        std::thread([this, info]() mutable {
-            try {
-                Bson out;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    out = NapcatCore::queryStatus();
-                }
-                info.post(out);
-            } catch (const std::exception &e) {
-                info.postError(e.what());
+    std::thread([this, info]() mutable {
+        try {
+            Bson out;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                out = NapcatCore::queryStatus();
             }
-        }).detach();
-    } catch (const std::exception &e) {
-        info.postError(e.what());
-    }
+            info.post(out);
+        } catch (const std::exception &e) {
+            info.postError(e.what());
+        }
+    }).detach();
 }
 
 void JSNapcatModule::getDeviceInfo(JQAsyncInfo &info)
@@ -105,14 +99,12 @@ void JSNapcatModule::stop(JQAsyncInfo &info)
 void JSNapcatModule::getLogs(JQAsyncInfo &info)
 {
     int tail = 200;
-    if (info.Length() >= 1 && info[0].is_int()) tail = info[0].int_value();
+    if (info.Length() >= 1 && info[0].is_number()) tail = info[0].int_value();
     tail = clampInt(tail, 1, 2000);
 
     std::thread([info, tail]() mutable {
         try {
-            Bson out;
-            out["text"] = NapcatCore::readLogTail(tail);
-            info.post(out);
+            info.post(Bson::object{{"text", NapcatCore::readLogTail(tail)}});
         } catch (const std::exception &e) {
             info.postError(e.what());
         }
@@ -124,9 +116,7 @@ void JSNapcatModule::clearLogs(JQAsyncInfo &info)
     std::thread([info]() mutable {
         try {
             NapcatCore::clearLogs();
-            Bson out;
-            out["ok"] = true;
-            info.post(out);
+            info.post(Bson::object{{"ok", true}});
         } catch (const std::exception &e) {
             info.postError(e.what());
         }
@@ -155,9 +145,7 @@ void JSNapcatModule::writeConfig(JQAsyncInfo &info)
     std::thread([info, patch]() mutable {
         try {
             NapcatCore::writeConfig(patch);
-            Bson out;
-            out["ok"] = true;
-            info.post(out);
+            info.post(Bson::object{{"ok", true}});
         } catch (const std::exception &e) {
             info.postError(e.what());
         }
@@ -168,9 +156,7 @@ void JSNapcatModule::getQrcode(JQAsyncInfo &info)
 {
     std::thread([info]() mutable {
         try {
-            Bson out;
-            out["base64"] = NapcatCore::readQrcodeBase64();
-            info.post(out);
+            info.post(Bson::object{{"base64", NapcatCore::readQrcodeBase64()}});
         } catch (const std::exception &e) {
             info.postError(e.what());
         }
@@ -224,15 +210,3 @@ int JSNapcatModule::clampInt(int v, int lo, int hi)
     return v;
 }
 
-bool JSNapcatModule::isSafeName(const std::string &s, size_t maxLen)
-{
-    if (s.empty() || s.size() > maxLen) return false;
-    // 只允许字母数字与少数符号，杜绝路径穿越
-    for (char c : s) {
-        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
-        if (!ok) return false;
-    }
-    if (s.find("..") != std::string::npos) return false;
-    return true;
-}

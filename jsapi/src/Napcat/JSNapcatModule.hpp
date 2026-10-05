@@ -46,7 +46,6 @@ public:
 
 private:
     // 校验辅助
-    static bool isSafeName(const std::string &s, size_t maxLen);
     static int clampInt(int v, int lo, int hi);
 
     std::mutex mutex_;

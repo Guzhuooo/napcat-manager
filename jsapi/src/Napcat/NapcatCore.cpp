@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #include <sys/stat.h>
@@ -26,10 +27,10 @@ namespace {
 
 const char *kStartScript = "/userdisk/napcat/bin/start-napcat.sh";
 const char *kStopScript  = "/userdisk/napcat/bin/stop-napcat.sh";
-// chroot 内 NapCat 缓存的二维码
 const char *kQrcodeInChroot =
     "/userdisk/napcat/rootfs/opt/QQ/resources/app/napcat/cache/qrcode.png";
-const char *kQrcodeCopy = "/userdisk/napcat/state/qrcode.png";
+const char *kWebuiCfg =
+    "/userdisk/napcat/rootfs/opt/QQ/resources/app/napcat/config/webui.json";
 const int   kConfigVersion = 1;
 
 std::string trimTrailing(std::string s)
@@ -61,17 +62,18 @@ bool fileExists(const std::string &p)
     return ::stat(p.c_str(), &st) == 0;
 }
 
-// base64 编码（用于把二维码 PNG 传给 JS 显示）
+// base64 编码（把二维码 PNG 传给 JS 显示）
 std::string base64Encode(const std::string &in)
 {
-    static const char *tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const char *tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
     out.reserve(((in.size() + 2) / 3) * 4);
     size_t i = 0;
     while (i + 2 < in.size()) {
-        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
-                     (static_cast<unsigned char>(in[i + 1]) << 8) |
-                     static_cast<unsigned char>(in[i + 2]);
+        const unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
+                           (static_cast<unsigned char>(in[i + 1]) << 8) |
+                           static_cast<unsigned char>(in[i + 2]);
         out.push_back(tbl[(n >> 18) & 63]);
         out.push_back(tbl[(n >> 12) & 63]);
         out.push_back(tbl[(n >> 6) & 63]);
@@ -80,14 +82,14 @@ std::string base64Encode(const std::string &in)
     }
     const size_t rem = in.size() - i;
     if (rem == 1) {
-        unsigned n = static_cast<unsigned char>(in[i]) << 16;
+        const unsigned n = static_cast<unsigned char>(in[i]) << 16;
         out.push_back(tbl[(n >> 18) & 63]);
         out.push_back(tbl[(n >> 12) & 63]);
         out.push_back('=');
         out.push_back('=');
     } else if (rem == 2) {
-        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
-                     (static_cast<unsigned char>(in[i + 1]) << 8);
+        const unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
+                           (static_cast<unsigned char>(in[i + 1]) << 8);
         out.push_back(tbl[(n >> 18) & 63]);
         out.push_back(tbl[(n >> 12) & 63]);
         out.push_back(tbl[(n >> 6) & 63]);
@@ -96,7 +98,7 @@ std::string base64Encode(const std::string &in)
     return out;
 }
 
-// 从 json 文本里提取一个整数字段（避免引入完整 JSON 解析依赖）
+// 从 JSON 文本里取整数字段（避免引入完整解析依赖）
 bool extractInt(const std::string &json, const std::string &key, int &out)
 {
     const std::string pat = "\"" + key + "\"";
@@ -107,7 +109,7 @@ bool extractInt(const std::string &json, const std::string &key, int &out)
     ++p;
     while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
     char *end = nullptr;
-    long v = std::strtol(json.c_str() + p, &end, 10);
+    const long v = std::strtol(json.c_str() + p, &end, 10);
     if (end == json.c_str() + p) return false;
     out = static_cast<int>(v);
     return true;
@@ -136,8 +138,37 @@ std::string jsonEscape(const std::string &s)
     return o;
 }
 
-}  // namespace
+// 从 Bson 对象里安全取整数
+int bsonInt(const Bson &b, const char *k, int def)
+{
+    if (!b.is_object()) return def;
+    const Bson &v = b[k];
+    if (v.is_number()) return v.int_value();
+    return def;
+}
 
+bool bsonBool(const Bson &b, const char *k, bool def)
+{
+    if (!b.is_object()) return def;
+    const Bson &v = b[k];
+    if (v.is_bool()) return v.bool_value();
+    return def;
+}
+
+std::string bsonStr(const Bson &b, const char *k, const std::string &def)
+{
+    if (!b.is_object()) return def;
+    const Bson &v = b[k];
+    if (v.is_string()) return v.string_value();
+    return def;
+}
+
+std::string localIp()
+{
+    return std::string();
+}
+
+}  // namespace
 // ---------------------------------------------------------------- 命令执行
 
 std::string NapcatCore::exec(const std::string &cmd)
@@ -153,33 +184,26 @@ std::string NapcatCore::exec(const std::string &cmd)
     return out;
 }
 
-// 找 NapCat 主进程：命令行必须同时包含 "napcat" 与 qq 特征
-// 严格排除系统进程，避免误伤 miniapp
+// 找 NapCat 主进程。
+// 严格按「qq --no-sandbox」特征匹配，排除 zygote 子进程，
+// 绝不会误伤系统 miniapp / guardian_run / DictPen。
 int NapcatCore::findMainPid()
 {
-    // ps 输出示例： 327 root 0:04 ./qq --no-sandbox -q
-    // 只认「在 /userdisk/napcat 目录下启动、且命令行含 ./qq --no-sandbox」的进程
-    std::string ps = exec("ps -ef");
+    const std::string ps = exec("ps -ef");
     std::istringstream iss(ps);
     std::string line;
     while (std::getline(iss, line)) {
-        // 必须含 qq --no-sandbox（NapCat 的启动特征）
-        if (line.find("qq --no-sandbox") == std::string::npos &&
-            line.find("./qq --no-sandbox") == std::string::npos) {
-            continue;
-        }
-        // 排除 zygote 子进程（它们不是主进程）
+        if (line.find("qq --no-sandbox") == std::string::npos) continue;
         if (line.find("--type=zygote") != std::string::npos) continue;
         if (line.find("grep") != std::string::npos) continue;
-        // 解析第二列作为 PID
+        if (line.find("sh -c") != std::string::npos) continue;
+
         std::istringstream ls(line);
         std::string user, pidStr;
         ls >> user >> pidStr;
         char *end = nullptr;
-        long pid = std::strtol(pidStr.c_str(), &end, 10);
-        if (end != pidStr.c_str() && pid > 0) {
-            return static_cast<int>(pid);
-        }
+        const long pid = std::strtol(pidStr.c_str(), &end, 10);
+        if (end != pidStr.c_str() && pid > 0) return static_cast<int>(pid);
     }
     return -1;
 }
@@ -188,99 +212,85 @@ int NapcatCore::findMainPid()
 
 Bson NapcatCore::queryStatus()
 {
-    Bson out;
     const int pid = findMainPid();
-    out["running"] = (pid > 0);
-    out["pid"] = pid;
 
-    // 从 WebUI 配置读端口
     int webuiPort = 6099;
-    const std::string webuiCfg = readFileAll(
-        std::string(rootfsDir()) + "/opt/QQ/resources/app/napcat/config/webui.json");
+    const std::string webuiCfg = readFileAll(kWebuiCfg);
     if (!webuiCfg.empty()) extractInt(webuiCfg, "port", webuiPort);
-    out["webuiPort"] = webuiPort;
 
-    // OneBot 端口：从 onebot11 配置读，读不到给默认 3000
-    int onebotPort = 3000;
-    const std::string ob11 = readFileAll(
-        std::string(rootfsDir()) + "/opt/QQ/resources/app/napcat/config/onebot11.json");
-    if (!ob11.empty()) {
-        int p = 0;
-        if (extractInt(ob11, "port", p) && p > 0) onebotPort = p;
-    }
-    out["onebotPort"] = onebotPort;
+    // OneBot 端口：从 manager.json 读（用户可配），默认 3000
+    const Bson cfg = loadConfigOrDefault();
+    const int onebotPort = bsonInt(cfg, "onebotPort", 3000);
 
-    // 本机 IP（取 wlan0）
-    std::string ip = trimTrailing(exec("ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1"));
+    // 本机 IP（wlan0）
+    std::string ip = trimTrailing(
+        exec("ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1"));
     if (ip.empty()) ip = "127.0.0.1";
-    out["ip"] = ip;
 
-    // 登录账号（从日志里找最近一次登录成功）
+    // 登录账号：从日志里找最近一次登录成功
     std::string acct;
     const std::string log = readFileAll(logFile());
     const size_t pos = log.rfind("登录成功");
     if (pos != std::string::npos) {
-        // 形如：xxx | 登录成功 ...
         size_t start = log.rfind('\n', pos);
         start = (start == std::string::npos) ? 0 : start + 1;
-        size_t bar = log.find('|', start);
+        const size_t bar = log.find('|', start);
         if (bar != std::string::npos && bar < pos) {
             acct = trimTrailing(log.substr(start, bar - start));
         }
     }
-    out["account"] = acct;
 
-    return out;
+    return Bson::object{
+        {"running", pid > 0},
+        {"pid", static_cast<double>(pid)},
+        {"webuiPort", static_cast<double>(webuiPort)},
+        {"onebotPort", static_cast<double>(onebotPort)},
+        {"ip", ip},
+        {"account", acct}};
 }
 
 Bson NapcatCore::queryDeviceInfo()
 {
-    Bson out;
-
-    std::string ip = trimTrailing(exec("ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1"));
+    std::string ip = trimTrailing(
+        exec("ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1"));
     if (ip.empty()) ip = "127.0.0.1";
-    out["ip"] = ip;
-
-    const std::string compatible = readFileAll("/proc/device-tree/compatible");
-    out["model"] = trimTrailing(compatible);
 
     const std::string meminfo = readFileAll("/proc/meminfo");
-    auto memField = [&](const char *key) -> long {
-        size_t p = meminfo.find(key);
+    auto memField = [&](const char *key) -> double {
+        const size_t p = meminfo.find(key);
         if (p == std::string::npos) return 0;
-        return std::strtol(meminfo.c_str() + p + std::strlen(key), nullptr, 10);
+        return static_cast<double>(
+            std::strtoll(meminfo.c_str() + p + std::strlen(key), nullptr, 10));
     };
-    out["memTotalKb"] = static_cast<int64_t>(memField("MemTotal:"));
-    out["memAvailableKb"] = static_cast<int64_t>(memField("MemAvailable:"));
 
-    // /userdisk 剩余（KB）
-    std::string df = trimTrailing(exec("df -k /userdisk | tail -1 | awk '{print $4}'"));
-    out["diskFreeKb"] = static_cast<int64_t>(std::strtoll(df.c_str(), nullptr, 10));
+    const std::string df =
+        trimTrailing(exec("df -k /userdisk 2>/dev/null | tail -1 | awk '{print $4}'"));
+    const double diskFree = static_cast<double>(std::strtoll(df.c_str(), nullptr, 10));
 
-    return out;
+    return Bson::object{
+        {"ip", ip},
+        {"model", trimTrailing(readFileAll("/proc/device-tree/compatible"))},
+        {"memTotalKb", memField("MemTotal:")},
+        {"memAvailableKb", memField("MemAvailable:")},
+        {"diskFreeKb", diskFree}};
 }
 
 // ---------------------------------------------------------------- 启停
 
 Bson NapcatCore::start()
 {
-    if (findMainPid() > 0) {
-        return queryStatus();  // 幂等：已在跑
-    }
+    if (findMainPid() > 0) return queryStatus();  // 幂等
     if (!fileExists(kStartScript)) {
         throw std::runtime_error("缺少启动脚本: " + std::string(kStartScript));
     }
     exec(std::string("sh ") + kStartScript);
-    // 给进程一点时间起来，但不必等太久（前端会轮询）
     ::usleep(1500 * 1000);
     return queryStatus();
 }
 
 Bson NapcatCore::stop()
 {
-    if (findMainPid() < 0) {
-        return queryStatus();  // 幂等：已停
-    }
+    if (findMainPid() < 0) return queryStatus();  // 幂等
     if (!fileExists(kStopScript)) {
         throw std::runtime_error("缺少停止脚本: " + std::string(kStopScript));
     }
@@ -291,28 +301,33 @@ Bson NapcatCore::stop()
 
 Bson NapcatCore::quickLogin(const std::string &qq)
 {
-    // 先停，再带 -q 参数启动
     exec(std::string("sh ") + kStopScript);
     ::usleep(800 * 1000);
 
-    Bson out;
-    if (qq.empty()) {
-        exec(std::string("sh ") + kStartScript);
-        out["mode"] = "qrcode";
-    } else {
-        // 参数已在上层校验为纯数字，这里再兜一次
-        std::string safe;
+    std::string mode = "qrcode";
+    std::string safeQq;
+
+    if (!qq.empty()) {
+        // 二次兜底：只保留数字
         for (char c : qq) {
-            if (c >= '0' && c <= '9') safe.push_back(c);
+            if (c >= '0' && c <= '9') safeQq.push_back(c);
         }
-        if (safe.empty()) throw std::runtime_error("QQ 号不合法");
-        exec(std::string("sh ") + kStartScript + " " + safe);
-        out["mode"] = "quick";
-        out["qq"] = safe;
+        if (safeQq.empty()) throw std::runtime_error("QQ 号不合法");
+        if (safeQq.size() < 5 || safeQq.size() > 12) {
+            throw std::runtime_error("QQ 号长度不合法");
+        }
+        exec(std::string("sh ") + kStartScript + " " + safeQq);
+        mode = "quick";
+    } else {
+        exec(std::string("sh ") + kStartScript);
     }
+
     ::usleep(1500 * 1000);
-    out["status"] = queryStatus();
-    return out;
+
+    return Bson::object{
+        {"mode", mode},
+        {"qq", safeQq},
+        {"status", queryStatus()}};
 }
 
 // ---------------------------------------------------------------- 日志
@@ -321,15 +336,13 @@ std::string NapcatCore::readLogTail(int lines)
 {
     if (lines < 1) lines = 1;
     if (lines > 2000) lines = 2000;
-    // tail -n 是安全的固定形式，lines 已 clamp 为整数
     char cmd[256];
     std::snprintf(cmd, sizeof(cmd), "tail -n %d %s", lines, logFile());
-    std::string out = exec(cmd);
-    if (out.empty() && !fileExists(logFile())) {
-        return std::string("(日志文件尚未生成)");
-    }
+    const std::string raw = exec(cmd);
+    if (raw.empty() && !fileExists(logFile())) return std::string("(日志文件尚未生成)");
+
     // 过滤无意义的 asound 噪音
-    std::istringstream iss(out);
+    std::istringstream iss(raw);
     std::string line, filtered;
     while (std::getline(iss, line)) {
         if (line.find("asound.so.2: no version information") != std::string::npos) continue;
@@ -348,59 +361,50 @@ void NapcatCore::clearLogs()
 
 Bson NapcatCore::loadConfigOrDefault()
 {
-    Bson cfg;
-    cfg["version"] = kConfigVersion;
-    cfg["webuiPort"] = 6099;
-    cfg["onebotPort"] = 3000;
-    cfg["autoStart"] = false;
-    cfg["autoRestart"] = false;
-    cfg["token"] = "";
+    int webui = 6099, onebot = 3000, ver = kConfigVersion;
+    bool autoStart = false, autoRestart = false, corrupt = false;
+    std::string token;
 
     const std::string raw = readFileAll(configFile());
-    if (raw.empty()) return cfg;  // 首次运行 / 空文件
-
-    try {
-        // 用最朴素的方式从 JSON 里取字段，损坏时回退默认值
-        int v = 0;
-        if (extractInt(raw, "version", v) && v != kConfigVersion) {
-            // 版本不匹配：保留默认值，让上层提示需要迁移
-        } else {
+    if (!raw.empty()) {
+        try {
+            int v = 0;
+            if (extractInt(raw, "version", v)) ver = v;
             int n = 0;
-            if (extractInt(raw, "webuiPort", n) && n > 0 && n < 65536) cfg["webuiPort"] = n;
-            if (extractInt(raw, "onebotPort", n) && n > 0 && n < 65536) cfg["onebotPort"] = n;
-            if (extractInt(raw, "version", n)) cfg["version"] = n;
+            if (extractInt(raw, "webuiPort", n) && n > 0 && n < 65536) webui = n;
+            if (extractInt(raw, "onebotPort", n) && n > 0 && n < 65536) onebot = n;
+
+            if (raw.find("\"autoStart\": true") != std::string::npos) autoStart = true;
+            if (raw.find("\"autoRestart\": true") != std::string::npos) autoRestart = true;
+
+            const std::string key = "\"token\"";
+            const size_t p = raw.find(key);
+            if (p != std::string::npos) {
+                const size_t q1 = raw.find('"', raw.find(':', p) + 1);
+                if (q1 != std::string::npos) {
+                    const size_t q2 = raw.find('"', q1 + 1);
+                    if (q2 != std::string::npos) token = raw.substr(q1 + 1, q2 - q1 - 1);
+                }
+            }
+        } catch (...) {
+            corrupt = true;  // 损坏兜底：仍返回可用默认值
         }
-        // 布尔与字符串字段
-        auto pickBool = [&](const char *k) {
-            if (raw.find(std::string("\"") + k + "\": true") != std::string::npos) cfg[k] = true;
-            else if (raw.find(std::string("\"") + k + "\": false") != std::string::npos) cfg[k] = false;
-        };
-        pickBool("autoStart");
-        pickBool("autoRestart");
-        cfg["_corrupt"] = false;
-    } catch (...) {
-        cfg["_corrupt"] = true;  // 损坏兜底：仍返回可用默认值
     }
-    return cfg;
+
+    return Bson::object{
+        {"version", static_cast<double>(ver)},
+        {"webuiPort", static_cast<double>(webui)},
+        {"onebotPort", static_cast<double>(onebot)},
+        {"autoStart", autoStart},
+        {"autoRestart", autoRestart},
+        {"token", token},
+        {"_corrupt", corrupt}};
 }
 
 void NapcatCore::saveConfig(const Bson &cfg)
 {
-    auto intOf = [&](const char *k, int def) -> int {
-        if (cfg.contains(k) && cfg[k].is_int()) return cfg[k].int_value();
-        return def;
-    };
-    auto boolOf = [&](const char *k, bool def) -> bool {
-        if (cfg.contains(k) && cfg[k].is_bool()) return cfg[k].bool_value();
-        return def;
-    };
-    auto strOf = [&](const char *k)->std::string {
-        if (cfg.contains(k) && cfg[k].is_string()) return cfg[k].string_value();
-        return std::string();
-    };
-
-    int webui = intOf("webuiPort", 6099);
-    int ob11 = intOf("onebotPort", 3000);
+    const int webui = bsonInt(cfg, "webuiPort", 6099);
+    const int ob11 = bsonInt(cfg, "onebotPort", 3000);
     if (webui < 1 || webui > 65535) throw std::runtime_error("webuiPort 超出范围");
     if (ob11 < 1 || ob11 > 65535) throw std::runtime_error("onebotPort 超出范围");
 
@@ -409,12 +413,11 @@ void NapcatCore::saveConfig(const Bson &cfg)
        << "  \"version\": " << kConfigVersion << ",\n"
        << "  \"webuiPort\": " << webui << ",\n"
        << "  \"onebotPort\": " << ob11 << ",\n"
-       << "  \"autoStart\": " << (boolOf("autoStart", false) ? "true" : "false") << ",\n"
-       << "  \"autoRestart\": " << (boolOf("autoRestart", false) ? "true" : "false") << ",\n"
-       << "  \"token\": \"" << jsonEscape(strOf("token")) << "\"\n"
+       << "  \"autoStart\": " << (bsonBool(cfg, "autoStart", false) ? "true" : "false") << ",\n"
+       << "  \"autoRestart\": " << (bsonBool(cfg, "autoRestart", false) ? "true" : "false") << ",\n"
+       << "  \"token\": \"" << jsonEscape(bsonStr(cfg, "token", "")) << "\"\n"
        << "}\n";
 
-    ::mkdir(stateDir(), 0755);
     writeFileAll(configFile(), js.str());
 }
 
@@ -425,24 +428,36 @@ Bson NapcatCore::readConfig()
 
 void NapcatCore::writeConfig(const Bson &patch)
 {
-    Bson cur = loadConfigOrDefault();
-    // 合并（白名单字段）
-    for (const char *k : {"webuiPort", "onebotPort", "autoStart", "autoRestart", "token"}) {
-        if (patch.contains(k)) cur[k] = patch[k];
-    }
-    saveConfig(cur);
+    // 以当前值为基础做白名单合并
+    const Bson cur = loadConfigOrDefault();
+
+    const int webui = bsonInt(patch, "webuiPort", bsonInt(cur, "webuiPort", 6099));
+    const int ob11 = bsonInt(patch, "onebotPort", bsonInt(cur, "onebotPort", 3000));
+    const bool aStart = bsonBool(patch, "autoStart", bsonBool(cur, "autoStart", false));
+    const bool aRestart = bsonBool(patch, "autoRestart", bsonBool(cur, "autoRestart", false));
+    const std::string token = bsonStr(patch, "token", bsonStr(cur, "token", ""));
+
+    const Bson merged = Bson::object{
+        {"version", static_cast<double>(kConfigVersion)},
+        {"webuiPort", static_cast<double>(webui)},
+        {"onebotPort", static_cast<double>(ob11)},
+        {"autoStart", aStart},
+        {"autoRestart", aRestart},
+        {"token", token}};
+
+    saveConfig(merged);
 }
 
 // ---------------------------------------------------------------- 二维码
 
 std::string NapcatCore::readQrcodeBase64()
 {
-    // 只读 chroot 内 NapCat 生成的那张，不主动触发登录流程
+    // 只读 NapCat 已生成的那张；不主动触发登录流程
     if (!fileExists(kQrcodeInChroot)) return std::string();
     const std::string png = readFileAll(kQrcodeInChroot);
-    if (png.empty() || png.size() > 512 * 1024) return std::string();
-    // 校验 PNG magic，避免把损坏文件传出去
-    if (png.size() < 8 || png.compare(0, 8, "\x89PNG\r\n\x1a\n") != 0) return std::string();
+    if (png.size() < 8 || png.size() > 512 * 1024) return std::string();
+    // 校验 PNG magic，避免传出损坏文件
+    if (png.compare(0, 8, "\x89PNG\r\n\x1a\n") != 0) return std::string();
     return base64Encode(png);
 }
 
@@ -450,35 +465,35 @@ std::string NapcatCore::readQrcodeBase64()
 
 Bson NapcatCore::pingOneBot()
 {
-    Bson out;
-    Bson st = queryStatus();
-    const int port = st.contains("onebotPort") && st["onebotPort"].is_int()
-                         ? st["onebotPort"].int_value()
-                         : 3000;
+    const Bson st = queryStatus();
+    const int port = bsonInt(st, "onebotPort", 3000);
 
     char cmd[512];
-    // 用 curl 探测本机 OneBot HTTP 端口；--max-time 防挂死
     std::snprintf(cmd, sizeof(cmd),
                   "curl -s -o /dev/null -w '%%{http_code} %%{time_total}' --max-time 4 "
                   "http://127.0.0.1:%d/ 2>/dev/null",
                   port);
     const std::string r = trimTrailing(exec(cmd));
+
     std::istringstream iss(r);
     std::string codeStr, timeStr;
     iss >> codeStr >> timeStr;
 
     if (codeStr.empty() || codeStr == "000") {
-        out["ok"] = false;
-        out["message"] = "端口未监听或连接失败";
-        out["status"] = 0;
-        out["latencyMs"] = -1;
-    } else {
-        out["ok"] = true;
-        out["status"] = std::atoi(codeStr.c_str());
-        out["latencyMs"] = static_cast<int>(std::atof(timeStr.c_str()) * 1000);
+        return Bson::object{
+            {"ok", false},
+            {"message", std::string("端口未监听或连接失败")},
+            {"status", 0.0},
+            {"latencyMs", -1.0},
+            {"port", static_cast<double>(port)}};
     }
-    out["port"] = port;
-    return out;
+
+    return Bson::object{
+        {"ok", true},
+        {"message", std::string()},
+        {"status", static_cast<double>(std::atoi(codeStr.c_str()))},
+        {"latencyMs", std::atof(timeStr.c_str()) * 1000.0},
+        {"port", static_cast<double>(port)}};
 }
 
 }  // namespace napcat
