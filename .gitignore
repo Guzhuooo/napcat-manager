@@ -6,3 +6,4 @@ build/
 *.amr
 *.log
 .DS_Store
+aiot-vue-cli/
