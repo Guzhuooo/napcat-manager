@@ -2,6 +2,11 @@
 #include "Napcat/NapcatCore.hpp"
 #include <jqutil_v2/jqbson.h>
 
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
 using namespace napcat;
 
 extern JSValue createNapcatModule(JQModuleEnv *env)
