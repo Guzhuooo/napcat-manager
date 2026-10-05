@@ -127,6 +127,14 @@ env -u LD_LIBRARY_PATH DISPLAY=:99 chroot $R /bin/sh -c \
 4. **`libbugly.so` 依赖 GnuTLS 符号但不声明 NEEDED** → 需 `LD_PRELOAD=/lib/libgnutls.so.30`。
 5. **宿主 `LD_LIBRARY_PATH` 会污染 chroot**（含 `/oem/YoudaoDictPen/...`）→ 必须 `env -u LD_LIBRARY_PATH`。
 6. **busybox `ar` 只能列出不能解包** → `.deb` 需在开发机解或另装 binutils。
+7. **OneBot 配置按账号隔离**：`onebot11_<QQ>.json` 每号一份。换账号扫码后
+   NapCat 为新号生成默认配置（全关），旧配置不生效 —— 管理器必须定位
+   「当前活跃账号」（进程 `-q` 参数优先，其次最新文件）。
+8. **QQ 快速登录凭据会过期**（腾讯安全策略），提示"用户身份已失效"时
+   需重新扫码；管理器持久化当前 QQ 号，重启自动 `-q` 快速登录，
+   失效时由 NapCat 回落二维码。
+9. **chroot 内路径不能用宿主绝对路径**：`chroot $R /bin/sh /userdisk/...`
+   会报 can't open —— 必须用 chroot 内路径 `/root/bin/...`。
 
 ## 完整回滚
 
