@@ -3,18 +3,20 @@
 // 职责：把 native 模块的能力包成稳定接口，统一错误语义。
 // 页面只消费这里的方法，不直接碰 native 模块，也不做能力探测。
 //
-// native 模块不可用时（例如还没装带 .so 的包），提供 mock 降级，
-// 让 UI 仍可渲染，并在 status.mock 里标注，避免"假装成功"。
+// 关于模块加载：
+//   Falcon 运行时用 ES module，native 模块通过 import 引入。
+//   这里用静态 import 是构建期行为 —— 打包器会把 'napcat' 当外部模块
+//   保留为运行时 import，因此 .so 缺失时会在运行时报错而非构建失败。
+//   我们捕获首次调用错误，降级为「native 缺失」而不是崩溃。
 
-let mod = null
+import { NapcatModule } from 'napcat'
+
+const mod = NapcatModule
 let modError = null
 
-try {
-  // eslint-disable-next-line
-  mod = require('napcat').NapcatModule
-} catch (err) {
-  modError = String(err && err.message ? err.message : err)
-  console.log('[napcat-service] native 模块加载失败: ' + modError)
+if (!mod) {
+  modError = 'native 模块未导出 NapcatModule'
+  console.log('[napcat-service] ' + modError)
 }
 
 export const isNativeAvailable = () => !!mod
@@ -64,6 +66,19 @@ export async function getStatus() {
     ip: d.ip || '',
     account: d.account || ''
   }
+}
+
+// 同步方法自检：不涉及 Promise，用于区分「模块不可用」与「异步挂起」
+export function probeSync() {
+  if (!mod) return 'mod=null'
+  const keys = Object.keys(mod).join(',')
+  let ver = '-'
+  try {
+    ver = typeof mod.getVersion === 'function' ? mod.getVersion() : 'no-getVersion'
+  } catch (e) {
+    ver = 'throw:' + (e && e.message ? e.message : e)
+  }
+  return 'keys=[' + keys + '] ver=' + ver
 }
 
 export async function getDeviceInfo() {

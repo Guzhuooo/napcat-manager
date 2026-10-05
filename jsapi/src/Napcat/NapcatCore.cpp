@@ -187,6 +187,9 @@ std::string NapcatCore::exec(const std::string &cmd)
 // 找 NapCat 主进程。
 // 严格按「qq --no-sandbox」特征匹配，排除 zygote 子进程，
 // 绝不会误伤系统 miniapp / guardian_run / DictPen。
+//
+// 注意：本设备 busybox 的 `ps -ef` 输出为三列
+//   "  PID USER  TIME CMD"，没有 UID 列，因此第一列就是 PID。
 int NapcatCore::findMainPid()
 {
     const std::string ps = exec("ps -ef");
@@ -196,11 +199,15 @@ int NapcatCore::findMainPid()
         if (line.find("qq --no-sandbox") == std::string::npos) continue;
         if (line.find("--type=zygote") != std::string::npos) continue;
         if (line.find("grep") != std::string::npos) continue;
+        // 排除采集命令自身（形如 "sh -c ... qq --no-sandbox ..."）
         if (line.find("sh -c") != std::string::npos) continue;
+        // 排除标题行
+        if (line.find("PID") != std::string::npos && line.find("CMD") != std::string::npos) continue;
 
+        // 第一列就是 PID
         std::istringstream ls(line);
-        std::string user, pidStr;
-        ls >> user >> pidStr;
+        std::string pidStr;
+        ls >> pidStr;
         char *end = nullptr;
         const long pid = std::strtol(pidStr.c_str(), &end, 10);
         if (end != pidStr.c_str() && pid > 0) return static_cast<int>(pid);

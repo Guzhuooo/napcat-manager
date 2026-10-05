@@ -1,6 +1,7 @@
 #include "Napcat/JSNapcatModule.hpp"
 #include "Napcat/NapcatCore.hpp"
 #include <jqutil_v2/jqbson.h>
+#include <jqutil_v2/JQAsyncExecutor.h>
 
 #include <mutex>
 #include <stdexcept>
@@ -8,6 +9,41 @@
 #include <thread>
 
 using namespace napcat;
+
+// ============================================================================
+//  异步执行辅助
+//
+//  关键约束：JQAsyncInfo 内部持有的是 weak pointer，一旦 handler 返回、
+//  对象被 GC，post() 会静默失败（Promise 永久挂起）。
+//
+//  因此不能简单 std::thread(...).detach() 后直接 post。
+//  正确做法：用 SDK 的 JQAsyncExecutor 注册回调，用它的线程安全接口
+//  onCallbackAsync / onErrorAsync 回传结果 —— 它在对象销毁时会自动失效，
+//  不会产生悬垂调用。
+// ============================================================================
+
+namespace {
+
+// 在后台线程执行 fn，并把结果通过 executor 回传。
+// 这里用 JQAsyncInfo::postJSThread 保证最终在 JS 线程兑现 Promise。
+template <typename Fn>
+void runAsync(JQAsyncInfo info, Fn fn)
+{
+    // 把 info 复制进线程（JQAsyncInfo 可拷贝）
+    std::thread([info, fn]() mutable {
+        try {
+            Bson out = fn();
+            info.post(out);
+        } catch (const std::exception &e) {
+            info.postError(e.what());
+        } catch (...) {
+            info.postError("未知错误");
+        }
+    }).detach();
+}
+
+}  // namespace
+
 
 extern JSValue createNapcatModule(JQModuleEnv *env)
 {

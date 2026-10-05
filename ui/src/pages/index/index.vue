@@ -82,6 +82,7 @@
       <scroller class="logscroll" scroll-y="true">
         <text class="logtext">{{ logText }}</text>
       </scroller>
+      <text class="logtext">{{ probeText }}</text>
     </div>
 
     <!-- 提示条 -->
@@ -106,7 +107,17 @@
 
 <script>
 import { BasePage } from '../../base-page.js'
-import * as napcat from '../../services/napcat.js'
+import {
+  getStatus,
+  getDeviceInfo,
+  start as napcatStart,
+  stop as napcatStop,
+  pingOneBot,
+  getLogs,
+  clearLogs,
+  isNativeAvailable,
+  probeSync
+} from '../../services/napcat.js'
 
 // 轮询间隔（毫秒）。NapCat 启停是秒级操作，2.5s 足够且不浪费 CPU。
 const POLL_MS = 2500
@@ -128,7 +139,8 @@ export default {
       logText: '（尚未加载）',
       logModal: false,
       onebotResult: null,
-      nativeAvailable: napcat.isNativeAvailable()
+      nativeAvailable: isNativeAvailable(),
+      probeText: '…'
     }
   },
 
@@ -164,50 +176,101 @@ export default {
     }
   },
 
-  onLoad() {
-    this.options = {}
-    if (!this.nativeAvailable) {
-      this.showToast('native 模块缺失，功能受限')
-    }
-  },
-
-  onShow() {
-    // 进入页面即开始轮询；每次 onShow 都重置，避免重复定时器
-    this.startPoll()
-  },
-
-  onHide() {
-    this.stopPoll()
-  },
-
-  onUnload() {
-    // BasePage.onUnload 会 release timer，这里只需停轮询逻辑
-    this.stopPoll()
-  },
-
   methods: {
+    // ================================================================
+    // 生命周期钩子必须放在 methods 里！
+    // BasePage 通过 this.$root.onShow() / onHide() / onUnload() 调用，
+    // 它们被视为 Vue 组件方法，放在顶层（Vue options）不会被触发。
+    // ================================================================
+    onLoad() {
+      this.options = {}
+      if (!this.nativeAvailable) {
+        this.showToast('native 模块缺失，功能受限')
+      }
+      // 诊断：把 native 模块的实际形态显示到界面，便于真机排查
+      this.probe()
+    },
+
+    // 一次性自检：先测同步方法（区分模块不可用 vs 异步挂起），再测异步
+    async probe() {
+      const lines = []
+      lines.push('native=' + (this.nativeAvailable ? 'ok' : 'missing'))
+      // 同步自检：若这行能出结果，说明模块可用，问题在异步
+      try {
+        lines.push(probeSync())
+      } catch (e) {
+        lines.push('probeSync throw: ' + (e && e.message ? e.message : e))
+      }
+      this.probeText = lines.join(' | ')
+
+      // 异步自检单独一步，避免卡住时看不到上面的结果
+      try {
+        const r = await getStatus()
+        lines.push('getStatus=' + (r && !r.error ? 'ok' : 'ERR:' + ((r && r.error) || 'empty')))
+        if (r && !r.error) lines.push('running=' + r.running)
+        this.probeText = lines.join(' | ')
+      } catch (e) {
+        lines.push('getStatus throw: ' + (e && e.message ? e.message : e))
+        this.probeText = lines.join(' | ')
+      }
+    },
+
+    onHide() {
+      this.stopPoll()
+    },
+
+    onShow() {
+      // 进入页面即开始轮询；每次 onShow 都重置，避免重复定时器
+      this.startPoll()
+    },
+
+    onUnload() {
+      // 先停轮询，再清理所有登记过的 timer，避免页面销毁后回调仍触发
+      this.stopPoll()
+      this._clearAllTimers()
+    },
+
+    // ---------- 定时器管理 ----------
+    // 说明：Vue 组件实例拿不到 BasePage 的 timer 方法，
+    // 这里用全局 timer 并自行登记，onUnload 统一清理，避免泄漏。
+    _addTimer(token) {
+      if (!this._timers) this._timers = []
+      this._timers.push(token)
+      return token
+    },
+    _clearAllTimers() {
+      if (!this._timers) return
+      for (const t of this._timers) {
+        clearTimeout(t)
+        clearInterval(t)
+      }
+      this._timers = []
+    },
+
     // ---------- 轮询 ----------
     startPoll() {
       this.stopPoll()
       this.refresh()
-      this.pollToken = this.setInterval(() => {
-        // 弹层打开或忙碌时不打扰
-        if (this.busy || this.logModal) return
-        this.refresh()
-      }, POLL_MS)
+      this.pollToken = this._addTimer(
+        setInterval(() => {
+          // 弹层打开或忙碌时不打扰
+          if (this.busy || this.logModal) return
+          this.refresh()
+        }, POLL_MS)
+      )
     },
 
     stopPoll() {
       if (this.pollToken != null) {
-        this.clearInterval(this.pollToken)
+        clearInterval(this.pollToken)
         this.pollToken = null
       }
     },
 
     async refresh() {
-      const st = await napcat.getStatus()
+      const st = await getStatus()
       this.status = st
-      const dev = await napcat.getDeviceInfo()
+      const dev = await getDeviceInfo()
       if (dev && !dev.error) this.device = dev
     },
 
@@ -220,7 +283,7 @@ export default {
       }
       this.busy = true
       this.showToast('正在启动…')
-      const r = await napcat.start()
+      const r = await napcatStart()
       this.busy = false
       if (!r.ok) {
         this.showToast('启动失败：' + r.error)
@@ -228,7 +291,7 @@ export default {
       }
       this.showToast('启动命令已下发')
       // 启动需要时间，稍后复查
-      this.setTimeout(() => this.refresh(), 3000)
+      this._addTimer(setTimeout(() => this.refresh(), 3000))
     },
 
     async onStop() {
@@ -239,7 +302,7 @@ export default {
       }
       this.busy = true
       this.showToast('正在停止…')
-      const r = await napcat.stop()
+      const r = await napcatStop()
       this.busy = false
       if (!r.ok) {
         this.showToast('停止失败：' + r.error)
@@ -252,7 +315,7 @@ export default {
     async onPing() {
       if (this.busy) return
       this.busy = true
-      const r = await napcat.pingOneBot()
+      const r = await pingOneBot()
       this.busy = false
       this.onebotResult = r
       if (!r.ok) {
@@ -268,12 +331,12 @@ export default {
     },
 
     async loadLogs(tail) {
-      const r = await napcat.getLogs(tail)
+      const r = await getLogs(tail)
       this.logText = r.ok ? (r.text || '（空）') : ('读取失败：' + r.error)
     },
 
     async onClearLogs() {
-      const r = await napcat.clearLogs()
+      const r = await clearLogs()
       if (r.ok) {
         this.logText = '（已清空）'
         this.showToast('日志已清空')
@@ -289,11 +352,13 @@ export default {
 
     showToast(msg) {
       this.toast = msg
-      if (this.toastToken) this.clearTimeout(this.toastToken)
-      this.toastToken = this.setTimeout(() => {
-        this.toast = ''
-        this.toastToken = null
-      }, 2200)
+      if (this.toastToken) clearTimeout(this.toastToken)
+      this.toastToken = this._addTimer(
+        setTimeout(() => {
+          this.toast = ''
+          this.toastToken = null
+        }, 2200)
+      )
     }
   }
 }

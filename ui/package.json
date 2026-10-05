@@ -27,7 +27,7 @@
     },
     "devDependencies": {
         "@vue/compiler-sfc": "^3.5.17",
-        "aiot-vue-cli": "link:../../aiot-vue-cli",
+        "aiot-vue-cli": "link:../aiot-vue-cli",
         "vue": "^3.5.17"
     },
     "packageManager": "pnpm@10.12.4",
