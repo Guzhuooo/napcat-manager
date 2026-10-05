@@ -35,7 +35,12 @@ public:
     static Bson readConfig();
     static void writeConfig(const Bson &patch);
 
-    // ---- 二维码 ----
+    // ---- OneBot 网络配置 ----
+    // 直接改写 NapCat 的 onebot11_<account>.json，让 OneBot 服务可开关。
+    // 会先备份原文件；写入后需重启 NapCat 生效。
+    static Bson setOnebot(bool enable, int port);
+
+    // ---- 登录 ----
     static std::string readQrcodeBase64();
 
     // ---- OneBot 探测 ----
@@ -48,10 +53,10 @@ public:
     static const char *stateDir();
     static const char *rootfsDir();
 
-private:
-    // 执行命令并取 stdout（用 popen，命令为内部常量）
+    // 执行命令并取 stdout（命令均为内部常量或经校验的整数参数）
     static std::string exec(const std::string &cmd);
 
+private:
     // 在 napcat 进程集合里找主进程 PID；找不到返回 -1
     static int findMainPid();
 

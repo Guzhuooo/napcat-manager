@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -225,25 +226,91 @@ Bson NapcatCore::queryStatus()
     const std::string webuiCfg = readFileAll(kWebuiCfg);
     if (!webuiCfg.empty()) extractInt(webuiCfg, "port", webuiPort);
 
-    // OneBot 端口：从 manager.json 读（用户可配），默认 3000
-    const Bson cfg = loadConfigOrDefault();
-    const int onebotPort = bsonInt(cfg, "onebotPort", 3000);
+    // OneBot 端口：从 napcat 的 onebot11_*.json 里读实际配置
+    int onebotPort = 0;          // 0 表示未启用
+    bool onebotEnabled = false;
+    {
+        const std::string cfgDir =
+            std::string(rootfsDir()) + "/opt/QQ/resources/app/napcat/config";
+        // 配置文件名带账号后缀，这里扫描目录找出 onebot11_*.json
+        const std::string ls = exec(("ls " + cfgDir + "/onebot11_*.json 2>/dev/null").c_str());
+        std::istringstream lss(ls);
+        std::string f;
+        while (std::getline(lss, f)) {
+            f = trimTrailing(f);
+            if (f.empty()) continue;
+            const std::string body = readFileAll(f);
+            if (body.find("\"httpServers\"") == std::string::npos) continue;
+            // 取第一个 httpServers 里的 port
+            int p = 0;
+            const size_t hp = body.find("\"httpServers\"");
+            if (hp != std::string::npos && extractInt(body.substr(hp), "port", p) && p > 0) {
+                onebotPort = p;
+                // enable 为 true 才算启用
+                const std::string seg = body.substr(hp, 600);
+                if (seg.find("\"enable\": true") != std::string::npos) onebotEnabled = true;
+                break;
+            }
+        }
+    }
 
     // 本机 IP（wlan0）
     std::string ip = trimTrailing(
         exec("ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1"));
     if (ip.empty()) ip = "127.0.0.1";
 
-    // 登录账号：从日志里找最近一次登录成功
-    std::string acct;
+    // ---- 登录状态判定 ----
+    // 依据：NapCat 日志中的明确标记
+    //   已登录：出现 "接收 <-" / "发送 ->" 这类消息收发记录
+    //   待扫码：最近 3 分钟内生成了 qrcode.png
+    std::string account;
+    bool loggedIn = false;
+    bool needQrcode = false;
+
     const std::string log = readFileAll(logFile());
-    const size_t pos = log.rfind("登录成功");
-    if (pos != std::string::npos) {
-        size_t start = log.rfind('\n', pos);
-        start = (start == std::string::npos) ? 0 : start + 1;
-        const size_t bar = log.find('|', start);
-        if (bar != std::string::npos && bar < pos) {
-            acct = trimTrailing(log.substr(start, bar - start));
+    if (!log.empty()) {
+        // 从后往前找最近一次成功登录
+        const size_t posOk = log.rfind("登录成功");
+        const size_t posErr = log.rfind("Login Error");
+        const size_t posRecv = log.rfind("接收 <-");
+        const size_t posSend = log.rfind("发送 ->");
+
+        // 有收发记录，说明确实在线
+        const bool hasTraffic =
+            (posRecv != std::string::npos) || (posSend != std::string::npos);
+        // 成功标记晚于最近一次错误，才算当前有效
+        const bool okAfterErr = (posOk != std::string::npos) &&
+                                (posErr == std::string::npos || posOk > posErr);
+        loggedIn = hasTraffic || okAfterErr;
+
+        // 账号名：形如 "小雫 | 接收 <- ..." 或 "登录成功 xxx"
+        if (hasTraffic) {
+            const size_t anchor = (posRecv != std::string::npos) ? posRecv : posSend;
+            size_t start = log.rfind('\n', anchor);
+            start = (start == std::string::npos) ? 0 : start + 1;
+            const size_t bar = log.find('|', start);
+            if (bar != std::string::npos && bar < anchor) {
+                account = trimTrailing(log.substr(start, bar - start));
+            }
+        }
+        if (account.empty() && okAfterErr) {
+            // 退而求其次：从 "可用于快速登录" 之后的账号行里取
+            const size_t p = log.rfind("可用于快速登录");
+            if (p != std::string::npos) {
+                const size_t nl = log.find('\n', p);
+                if (nl != std::string::npos) {
+                    account = trimTrailing(log.substr(nl + 1, 60));
+                }
+            }
+        }
+    }
+
+    // 二维码新鲜度：3 分钟内的才算"待扫码"
+    if (!loggedIn) {
+        struct stat st;
+        if (::stat(kQrcodeInChroot, &st) == 0) {
+            const time_t now = ::time(nullptr);
+            if (now - st.st_mtime < 180) needQrcode = true;
         }
     }
 
@@ -252,8 +319,11 @@ Bson NapcatCore::queryStatus()
         {"pid", static_cast<double>(pid)},
         {"webuiPort", static_cast<double>(webuiPort)},
         {"onebotPort", static_cast<double>(onebotPort)},
+        {"onebotEnabled", onebotEnabled},
         {"ip", ip},
-        {"account", acct}};
+        {"account", account},
+        {"loggedIn", loggedIn},
+        {"needQrcode", needQrcode}};
 }
 
 Bson NapcatCore::queryDeviceInfo()
@@ -453,6 +523,86 @@ void NapcatCore::writeConfig(const Bson &patch)
         {"token", token}};
 
     saveConfig(merged);
+}
+
+// ---------------------------------------------------------------- OneBot 配置
+
+// 定位 napcat 配置目录下的 onebot11_*.json（文件名带账号后缀）
+static std::string findOnebotConfig()
+{
+    const std::string cfgDir =
+        std::string(NapcatCore::rootfsDir()) + "/opt/QQ/resources/app/napcat/config";
+    const std::string ls = NapcatCore::exec("ls " + cfgDir + "/onebot11_*.json 2>/dev/null");
+    std::istringstream lss(ls);
+    std::string f;
+    while (std::getline(lss, f)) {
+        f = trimTrailing(f);
+        if (!f.empty()) return f;
+    }
+    return std::string();
+}
+
+Bson NapcatCore::setOnebot(bool enable, int port)
+{
+    if (port < 1 || port > 65535) {
+        throw std::runtime_error("端口超出范围 (1-65535)");
+    }
+
+    const std::string path = findOnebotConfig();
+    if (path.empty()) {
+        throw std::runtime_error("未找到 NapCat 的 onebot11 配置文件（请先启动过一次 NapCat）");
+    }
+
+    // 备份一次（只在首次备份，避免覆盖）
+    const std::string bak = path + ".mgr-bak";
+    if (!fileExists(bak)) {
+        const std::string orig = readFileAll(path);
+        if (!orig.empty()) writeFileAll(bak, orig);
+    }
+
+    // 用固定模板重写，字段严格匹配 NapCat schema
+    std::ostringstream js;
+    js << "{\n"
+       << "  \"network\": {\n"
+       << "    \"httpServers\": [\n"
+       << "      {\n"
+       << "        \"name\": \"manager-http\",\n"
+       << "        \"enable\": " << (enable ? "true" : "false") << ",\n"
+       << "        \"port\": " << port << ",\n"
+       << "        \"host\": \"0.0.0.0\",\n"
+       << "        \"enableCors\": true,\n"
+       << "        \"enableWebsocket\": true,\n"
+       << "        \"messagePostFormat\": \"array\",\n"
+       << "        \"token\": \"\",\n"
+       << "        \"debug\": false\n"
+       << "      }\n"
+       << "    ],\n"
+       << "    \"httpSseServers\": [],\n"
+       << "    \"httpClients\": [],\n"
+       << "    \"websocketServers\": [],\n"
+       << "    \"websocketClients\": [],\n"
+       << "    \"plugins\": []\n"
+       << "  },\n"
+       << "  \"musicSignUrl\": \"\",\n"
+       << "  \"enableLocalFile2Url\": false,\n"
+       << "  \"parseMultMsg\": false,\n"
+       << "  \"imageDownloadProxy\": \"\",\n"
+       << "  \"timeout\": {\n"
+       << "    \"baseTimeout\": 10000,\n"
+       << "    \"uploadSpeedKBps\": 256,\n"
+       << "    \"downloadSpeedKBps\": 256,\n"
+       << "    \"maxTimeout\": 1800000\n"
+       << "  }\n"
+       << "}\n";
+
+    writeFileAll(path, js.str());
+
+    return Bson::object{
+        {"ok", true},
+        {"path", path},
+        {"enable", enable},
+        {"port", static_cast<double>(port)},
+        {"needRestart", true}};
 }
 
 // ---------------------------------------------------------------- 二维码

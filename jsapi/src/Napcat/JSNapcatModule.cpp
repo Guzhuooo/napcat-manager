@@ -62,6 +62,7 @@ extern JSValue createNapcatModule(JQModuleEnv *env)
     tpl->SetProtoMethodPromise("clearLogs", &JSNapcatModule::clearLogs);
     tpl->SetProtoMethodPromise("readConfig", &JSNapcatModule::readConfig);
     tpl->SetProtoMethodPromise("writeConfig", &JSNapcatModule::writeConfig);
+    tpl->SetProtoMethodPromise("setOnebot", &JSNapcatModule::setOnebot);
     tpl->SetProtoMethodPromise("getQrcode", &JSNapcatModule::getQrcode);
     tpl->SetProtoMethodPromise("quickLogin", &JSNapcatModule::quickLogin);
     tpl->SetProtoMethodPromise("pingOneBot", &JSNapcatModule::pingOneBot);
@@ -198,6 +199,24 @@ void JSNapcatModule::getQrcode(JQAsyncInfo &info)
     std::thread([info]() mutable {
         try {
             info.post(Bson::object{{"base64", NapcatCore::readQrcodeBase64()}});
+        } catch (const std::exception &e) {
+            info.postError(e.what());
+        }
+    }).detach();
+}
+
+void JSNapcatModule::setOnebot(JQAsyncInfo &info)
+{
+    // 参数：enable(bool), port(int)
+    bool enable = true;
+    int port = 3000;
+    if (info.Length() >= 1 && info[0].is_bool()) enable = info[0].bool_value();
+    if (info.Length() >= 2 && info[1].is_number()) port = info[1].int_value();
+    port = clampInt(port, 1, 65535);
+
+    std::thread([info, enable, port]() mutable {
+        try {
+            info.post(NapcatCore::setOnebot(enable, port));
         } catch (const std::exception &e) {
             info.postError(e.what());
         }

@@ -37,6 +37,9 @@ public:
     void readConfig(JQAsyncInfo &info);      // -> object
     void writeConfig(JQAsyncInfo &info);     // (object) -> ok
 
+    // ---- OneBot 网络 ----
+    void setOnebot(JQAsyncInfo &info);       // (enable, port) -> ok
+
     // ---- 登录 ----
     void getQrcode(JQAsyncInfo &info);       // -> base64 png（无则空串）
     void quickLogin(JQAsyncInfo &info);      // (qq号) -> 触发快速登录
