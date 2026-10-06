@@ -167,9 +167,16 @@ chmod 755 "$R/root/bin/run-napcat.sh"
 
 # ------------------------------------------------ 7. 挂载点
 say "7/8 绑定挂载..."
-mp() { grep -q " $1 " /proc/mounts 2>/dev/null; }
+# 用 /proc/mounts 精确比对第二列判断是否已挂载。
+# 不能用 mountpoint：同一文件系统内的 bind 挂载 st_dev 不变会被误判为未挂载，
+# 导致重复叠挂（真机曾出现 /opt/QQ 叠 7 层）。
+is_mounted() {
+  awk -v m="$1" '$2 == m { found = 1; exit } END { exit(found ? 0 : 1) }' /proc/mounts
+}
 ensure_bind() { # src dst
-  mp "$2" || mount --bind "$1" "$2" 2>/dev/null
+  is_mounted "$2" && return 0
+  mkdir -p "$2" 2>/dev/null
+  mount --bind "$1" "$2" 2>/dev/null
 }
 ensure_bind /dev  "$R/dev"
 ensure_bind /proc "$R/proc"
@@ -181,6 +188,11 @@ ensure_bind "$BASE/mergedlib" "$R/lib"
 ensure_bind "$BASE/mergedlib" "$R/usr/lib"
 ensure_bind "$BASE/opt/QQ"    "$R/opt/QQ"
 # 注意：不 bind 宿主 /etc —— 保持与真机验证一致的最小环境
+
+# chroot 可用性自检：缺 /bin/sh 后续必然失败，提前报清楚
+if [ ! -x "$R/bin/sh" ]; then
+  die "chroot 不可用：$R/bin/sh 缺失（挂载失败？）"
+fi
 
 # ------------------------------------------------ 8. 管理器与自启脚本
 say "8/8 安装管理器与控制脚本..."

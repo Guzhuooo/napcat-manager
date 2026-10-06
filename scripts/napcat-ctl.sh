@@ -36,14 +36,40 @@ xvfb_running() {
     pgrep -f "Xvfb $XVFB_DISPLAY" >/dev/null 2>&1
 }
 
+# 判断路径是否已是挂载点。
+# 不能用 mountpoint/stat：同一文件系统内的 bind 挂载 st_dev 不变，
+# busybox mountpoint 会误判为"未挂载"从而重复叠挂。用 /proc/mounts 精确比对第二列。
+is_mounted() {
+    awk -v m="$1" '$2 == m { found = 1; exit } END { exit(found ? 0 : 1) }' /proc/mounts
+}
+
+# 幂等 bind 挂载（已挂则跳过；否则先建目录再挂）
+ensure_bind() { # src dst
+    is_mounted "$2" && return 0
+    mkdir -p "$2" 2>/dev/null
+    mount --bind "$1" "$2" 2>/dev/null
+}
+
 ensure_mounts() {
-    # chroot 的 bind mount 在重启后会丢失，这里按需重建
-    for d in /dev /proc /sys; do
-        mountpoint -q "$R$d" 2>/dev/null || mount --bind "$d" "$R$d" 2>/dev/null
-    done
-    [ -e "$R/lib/libtirpc.so.3" ] || mount --bind "$BASE/mergedlib" "$R/lib" 2>/dev/null
-    [ -e "$R/usr/lib/libtirpc.so.3" ] || mount --bind "$BASE/mergedlib" "$R/usr/lib" 2>/dev/null
-    mountpoint -q "$R/opt/QQ" 2>/dev/null || mount --bind "$BASE/opt/QQ" "$R/opt/QQ" 2>/dev/null
+    # chroot 的 bind mount 在设备重启后会全部丢失，这里按需完整重建。
+    # 注意：chroot 内要跑 Xvfb/QQ，/bin /sbin /tmp 一个都不能少
+    # （缺 /bin 会让 chroot 连 /bin/sh 都没有，Xvfb 直接起不来）。
+    ensure_bind /dev  "$R/dev"
+    ensure_bind /proc "$R/proc"
+    ensure_bind /sys  "$R/sys"
+    ensure_bind /tmp  "$R/tmp"
+    ensure_bind /bin  "$R/bin"
+    ensure_bind /sbin "$R/sbin"
+    ensure_bind "$BASE/mergedlib" "$R/lib"
+    ensure_bind "$BASE/mergedlib" "$R/usr/lib"
+    ensure_bind "$BASE/opt/QQ"    "$R/opt/QQ"
+
+    # 自检：chroot 必须可见 /bin/sh，否则后续启动必然失败，提前报清楚
+    if [ ! -x "$R/bin/sh" ]; then
+        echo "  [错误] chroot 不可用：$R/bin/sh 缺失，挂载失败或环境不完整"
+        return 1
+    fi
+    return 0
 }
 
 start_xvfb() {
@@ -72,7 +98,7 @@ do_start() {
         echo "$qq" > "$BASE/state/account"
     fi
 
-    ensure_mounts
+    ensure_mounts || return 1
     start_xvfb || return 1
 
     # 优先用保存的账号快速登录
